@@ -20,6 +20,7 @@
  *
  * To understand everything else, start reading main().
  */
+#include <stdbool.h>
 #include <errno.h>
 #include <locale.h>
 #include <signal.h>
@@ -92,7 +93,7 @@ struct Client {
 	int basew, baseh, incw, inch, maxw, maxh, minw, minh, hintsvalid;
 	int bw, oldbw;
 	unsigned int tags;
-	int isfixed, isfloating, isurgent, neverfocus, oldstate, isfullscreen;
+	int isfixed, isfloating, isurgent, neverfocus, oldstate, isfullscreen, cantfocus;
 	Client *next;
 	Client *snext;
 	Monitor *mon;
@@ -105,6 +106,12 @@ typedef struct {
 	void (*func)(const Arg *);
 	const Arg arg;
 } Key;
+
+typedef struct {
+	unsigned int signum;
+	void (*func)(const Arg *);
+	const Arg arg;
+} Signal;
 
 typedef struct {
 	const char *symbol;
@@ -177,6 +184,7 @@ static void grabbuttons(Client *c, int focused);
 static void grabkeys(void);
 static void incnmaster(const Arg *arg);
 static void keypress(XEvent *e);
+static int fake_signal(void);
 static void killclient(const Arg *arg);
 static void manage(Window w, XWindowAttributes *wa);
 static void mappingnotify(XEvent *e);
@@ -192,6 +200,7 @@ static Monitor *recttomon(int x, int y, int w, int h);
 static void resize(Client *c, int x, int y, int w, int h, int interact);
 static void resizeclient(Client *c, int x, int y, int w, int h);
 static void resizemouse(const Arg *arg);
+static void resetcanfocusfloating();
 static void restack(Monitor *m);
 static void run(void);
 static void scan(void);
@@ -211,6 +220,8 @@ static void tagmon(const Arg *arg);
 static void tile(Monitor *m);
 static void togglebar(const Arg *arg);
 static void togglefloating(const Arg *arg);
+static void togglecanfocusfloating(const Arg *arg);
+static void togglescratch(const Arg *arg);
 static void toggletag(const Arg *arg);
 static void toggleview(const Arg *arg);
 static void unfocus(Client *c, int setfocus);
@@ -270,6 +281,13 @@ static Window root, wmcheckwin;
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
+
+static unsigned int scratchtag = 1 << LENGTH(tags);
+static char *scratchname = "scratchpad";
+static char *defuaultscratchname = "New screen...";
+static char *brokerscratchname = "broken";
+static char *hackscratchname = "pulsemixer";
+static int scratchborder = 50;
 
 /* compile-time check if all tags fit into an unsigned int bit array. */
 struct NumTags { char limitexceeded[LENGTH(tags) > 31 ? -1 : 1]; };
@@ -524,7 +542,7 @@ clientmessage(XEvent *e)
 		if (cme->data.l[1] == netatom[NetWMFullscreen]
 		|| cme->data.l[2] == netatom[NetWMFullscreen])
 			setfullscreen(c, (cme->data.l[0] == 1 /* _NET_WM_STATE_ADD    */
-				|| (cme->data.l[0] == 2 /* _NET_WM_STATE_TOGGLE */ && !c->isfullscreen)));
+				|| cme->data.l[0] == 2 /* _NET_WM_STATE_TOGGLE */));
 	} else if (cme->message_type == netatom[NetActiveWindow]) {
 		if (c != selmon->sel && !c->isurgent)
 			seturgent(c, 1);
@@ -554,7 +572,6 @@ void
 configurenotify(XEvent *e)
 {
 	Monitor *m;
-	Client *c;
 	XConfigureEvent *ev = &e->xconfigure;
 	int dirty;
 
@@ -567,9 +584,6 @@ configurenotify(XEvent *e)
 			drw_resize(drw, sw, bh);
 			updatebars();
 			for (m = mons; m; m = m->next) {
-				for (c = m->clients; c; c = c->next)
-					if (c->isfullscreen)
-						resizeclient(c, m->mx, m->my, m->mw, m->mh);
 				XMoveResizeWindow(dpy, m->barwin, m->wx, m->by, m->ww, bh);
 			}
 			focus(NULL);
@@ -794,6 +808,8 @@ focus(Client *c)
 	if (selmon->sel && selmon->sel != c)
 		unfocus(selmon->sel, 0);
 	if (c) {
+        if (c->cantfocus)
+            return;
 		if (c->mon != selmon)
 			selmon = c->mon;
 		if (c->isurgent)
@@ -843,16 +859,16 @@ focusstack(const Arg *arg)
 	if (!selmon->sel || (selmon->sel->isfullscreen && lockfullscreen))
 		return;
 	if (arg->i > 0) {
-		for (c = selmon->sel->next; c && !ISVISIBLE(c); c = c->next);
+		for (c = selmon->sel->next; c && (!ISVISIBLE(c) || c->cantfocus); c = c->next);
 		if (!c)
-			for (c = selmon->clients; c && !ISVISIBLE(c); c = c->next);
+			for (c = selmon->clients; c && (!ISVISIBLE(c) || c->cantfocus); c = c->next);
 	} else {
 		for (i = selmon->clients; i != selmon->sel; i = i->next)
-			if (ISVISIBLE(i))
+			if (ISVISIBLE(i) && !i->cantfocus)
 				c = i;
 		if (!c)
 			for (; i; i = i->next)
-				if (ISVISIBLE(i))
+				if (ISVISIBLE(i) && i->cantfocus)
 					c = i;
 	}
 	if (c) {
@@ -1012,6 +1028,47 @@ keypress(XEvent *e)
 			keys[i].func(&(keys[i].arg));
 }
 
+int
+fake_signal(void)
+{
+	char fsignal[256];
+	char indicator[9] = "fsignal:";
+	char str_signum[16];
+	int i, v, signum;
+	size_t len_fsignal, len_indicator = strlen(indicator);
+
+	// Get root name property
+	if (gettextprop(root, XA_WM_NAME, fsignal, sizeof(fsignal))) {
+		len_fsignal = strlen(fsignal);
+
+		// Check if this is indeed a fake signal
+		if (len_indicator > len_fsignal ? 0 : strncmp(indicator, fsignal, len_indicator) == 0) {
+			memcpy(str_signum, &fsignal[len_indicator], len_fsignal - len_indicator);
+			str_signum[len_fsignal - len_indicator] = '\0';
+
+			// Convert string value into managable integer
+			for (i = signum = 0; i < strlen(str_signum); i++) {
+				v = str_signum[i] - '0';
+				if (v >= 0 && v <= 9) {
+					signum = signum * 10 + v;
+				}
+			}
+
+			// Check if a signal was found, and if so handle it
+			if (signum)
+				for (i = 0; i < LENGTH(signals); i++)
+					if (signum == signals[i].signum && signals[i].func)
+						signals[i].func(&(signals[i].arg));
+
+			// A fake signal was sent
+			return 1;
+		}
+	}
+
+	// No fake signal was sent, so proceed with update
+	return 0;
+}
+
 void
 killclient(const Arg *arg)
 {
@@ -1060,6 +1117,11 @@ manage(Window w, XWindowAttributes *wa)
 	c->x = MAX(c->x, c->mon->wx);
 	c->y = MAX(c->y, c->mon->wy);
 	c->bw = borderpx;
+
+    if (strstr(c->name, scratchname) || strstr(c->name, defuaultscratchname) || strstr(c->name, brokerscratchname) || strstr(c->name, hackscratchname)) {
+        c->x = c->x - scratchborder;
+        c->y = c->y + scratchborder;
+    }
 
 	wc.border_width = c->bw;
 	XConfigureWindow(dpy, w, CWBorderWidth, &wc);
@@ -1153,8 +1215,6 @@ movemouse(const Arg *arg)
 
 	if (!(c = selmon->sel))
 		return;
-	if (c->isfullscreen) /* no support moving fullscreen windows by mouse */
-		return;
 	restack(selmon);
 	ocx = c->x;
 	ocy = c->y;
@@ -1225,8 +1285,10 @@ propertynotify(XEvent *e)
 	Window trans;
 	XPropertyEvent *ev = &e->xproperty;
 
-	if ((ev->window == root) && (ev->atom == XA_WM_NAME))
-		updatestatus();
+	if ((ev->window == root) && (ev->atom == XA_WM_NAME)) {
+		if (!fake_signal())
+			updatestatus();
+    }
 	else if (ev->state == PropertyDelete)
 		return; /* ignore */
 	else if ((c = wintoclient(ev->window))) {
@@ -1307,8 +1369,6 @@ resizemouse(const Arg *arg)
 	Time lasttime = 0;
 
 	if (!(c = selmon->sel))
-		return;
-	if (c->isfullscreen) /* no support resizing fullscreen windows by mouse */
 		return;
 	restack(selmon);
 	ocx = c->x;
@@ -1486,24 +1546,10 @@ setfullscreen(Client *c, int fullscreen)
 		XChangeProperty(dpy, c->win, netatom[NetWMState], XA_ATOM, 32,
 			PropModeReplace, (unsigned char*)&netatom[NetWMFullscreen], 1);
 		c->isfullscreen = 1;
-		c->oldstate = c->isfloating;
-		c->oldbw = c->bw;
-		c->bw = 0;
-		c->isfloating = 1;
-		resizeclient(c, c->mon->mx, c->mon->my, c->mon->mw, c->mon->mh);
-		XRaiseWindow(dpy, c->win);
 	} else if (!fullscreen && c->isfullscreen){
 		XChangeProperty(dpy, c->win, netatom[NetWMState], XA_ATOM, 32,
 			PropModeReplace, (unsigned char*)0, 0);
 		c->isfullscreen = 0;
-		c->isfloating = c->oldstate;
-		c->bw = c->oldbw;
-		c->x = c->oldx;
-		c->y = c->oldy;
-		c->w = c->oldw;
-		c->h = c->oldh;
-		resizeclient(c, c->x, c->y, c->w, c->h);
-		arrange(c->mon);
 	}
 }
 
@@ -1634,7 +1680,7 @@ showhide(Client *c)
 	if (ISVISIBLE(c)) {
 		/* show clients top down */
 		XMoveWindow(dpy, c->win, c->x, c->y);
-		if ((!c->mon->lt[c->mon->sellt]->arrange || c->isfloating) && !c->isfullscreen)
+		if (!c->mon->lt[c->mon->sellt]->arrange || c->isfloating)
 			resize(c, c->x, c->y, c->w, c->h, 0);
 		showhide(c->snext);
 	} else {
@@ -1726,13 +1772,104 @@ togglefloating(const Arg *arg)
 {
 	if (!selmon->sel)
 		return;
-	if (selmon->sel->isfullscreen) /* no support for fullscreen windows */
-		return;
 	selmon->sel->isfloating = !selmon->sel->isfloating || selmon->sel->isfixed;
 	if (selmon->sel->isfloating)
 		resize(selmon->sel, selmon->sel->x, selmon->sel->y,
 			selmon->sel->w, selmon->sel->h, 0);
+    resetcanfocusfloating();
+
 	arrange(selmon);
+}
+
+void
+resetcanfocusfloating()
+{
+	unsigned int i, n;
+	Client *c;
+
+	for (n = 0, c = selmon->clients; c; c = c->next, n++);
+	if (n == 0)
+		return;
+
+	for (i = 0, c = selmon->clients; c; c = c->next, i++)
+    if (c->isfloating)
+      c->cantfocus = 0;
+
+	arrange(selmon);
+}
+
+void
+togglecanfocusfloating(const Arg *arg)
+{
+	unsigned int n;
+	Client *c, *cf = NULL;
+
+  if (!selmon->sel)
+      return;
+
+  for (c = selmon->clients; c; c = c->next)
+      if (c->cantfocus == 1) {
+          cf = c;
+      }
+
+  if (cf) {
+      resetcanfocusfloating();
+      focus(cf);
+  } else {
+    for (n = 0, c = selmon->clients; c; c = c->next)
+        if (c->isfloating)
+            c->cantfocus = !c->cantfocus;
+        else
+            n++;
+
+    if (n && selmon->sel->isfloating) {
+        c = nexttiled(selmon->clients);
+        focus(c);
+    }
+  }
+
+	arrange(selmon);
+}
+
+void
+togglescratch(const Arg *arg)
+{
+	Client *c;
+	unsigned int found = 0;
+
+    for (c = selmon->clients; c; c=c->next) {
+        if (strstr(c->name, scratchname) || strstr(c->name, defuaultscratchname) || strstr(c->name, brokerscratchname) || strstr(c->name, hackscratchname)) {
+            found = 1;
+            if (!sendevent(c, wmatom[WMDelete])) {
+                XGrabServer(dpy);
+                XSetErrorHandler(xerrordummy);
+                XSetCloseDownMode(dpy, DestroyAll);
+                XKillClient(dpy, c->win);
+                XSync(dpy, False);
+                XSetErrorHandler(xerror);
+                XUngrabServer(dpy);
+            }
+        }
+    }
+    if (!found) {
+        spawn(arg);
+    }
+
+//	for (c = selmon->clients; c && !(found = strcmp(c->name, "scratchpad")); c = c->next);
+//	if (found) {
+//        showhide(c);
+//		unsigned int newtagset = selmon->tagset[selmon->seltags] ^ scratchtag;
+//        
+//		if (newtagset) {
+//			selmon->tagset[selmon->seltags] = newtagset;
+//			focus(NULL);
+//			arrange(selmon);
+//		}
+//		if (ISVISIBLE(c)) {
+//			restack(selmon);
+//		}
+//	} else
+//        spawn(arg);
 }
 
 void
